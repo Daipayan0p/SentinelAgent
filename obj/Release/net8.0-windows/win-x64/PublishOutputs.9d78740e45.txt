@@ -1,0 +1,2 @@
+/Users/daipayan/Documents/SOC/SentinelAgent/bin/Release/net8.0-windows/win-x64/publish/SentinelAgent.pdb
+/Users/daipayan/Documents/SOC/SentinelAgent/bin/Release/net8.0-windows/win-x64/publish/SentinelAgent.exe

@@ -1,0 +1,6 @@
+{
+  "serverUrl": "http://localhost:8080/api/logs",
+  "batchSize": 50,
+  "sendIntervalSeconds": 5,
+  "maxBufferedLogs": 10000
+}

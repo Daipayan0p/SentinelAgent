@@ -1,0 +1,26 @@
+{
+  "version": 2,
+  "dgSpecHash": "SkNKI7Fllvg=",
+  "success": true,
+  "projectFilePath": "/Users/daipayan/Documents/SOC/SentinelAgent/SentinelAgent.csproj",
+  "expectedPackageFiles": [
+    "/Users/daipayan/.nuget/packages/microsoft.net.illink.tasks/8.0.29/microsoft.net.illink.tasks.8.0.29.nupkg.sha512",
+    "/Users/daipayan/.nuget/packages/system.diagnostics.eventlog/10.0.0/system.diagnostics.eventlog.10.0.0.nupkg.sha512",
+    "/Users/daipayan/.nuget/packages/microsoft.netcore.app.ref/8.0.29/microsoft.netcore.app.ref.8.0.29.nupkg.sha512",
+    "/Users/daipayan/.nuget/packages/microsoft.netcore.app.runtime.win-x64/8.0.29/microsoft.netcore.app.runtime.win-x64.8.0.29.nupkg.sha512",
+    "/Users/daipayan/.nuget/packages/microsoft.aspnetcore.app.ref/8.0.29/microsoft.aspnetcore.app.ref.8.0.29.nupkg.sha512",
+    "/Users/daipayan/.nuget/packages/microsoft.aspnetcore.app.runtime.win-x64/8.0.29/microsoft.aspnetcore.app.runtime.win-x64.8.0.29.nupkg.sha512",
+    "/Users/daipayan/.nuget/packages/microsoft.netcore.app.host.win-x64/8.0.29/microsoft.netcore.app.host.win-x64.8.0.29.nupkg.sha512"
+  ],
+  "logs": [
+    {
+      "code": "NU1900",
+      "level": "Warning",
+      "message": "Error occurred while getting package vulnerability data: Access to the path '/Users/daipayan/.local/share/NuGet/http-cache/670c1461c29885f9aa22c281d8b7da90845b38e4$ps:_api.nuget.org_v3_index.json' is denied.",
+      "projectPath": "/Users/daipayan/Documents/SOC/SentinelAgent/SentinelAgent.csproj",
+      "warningLevel": 1,
+      "filePath": "/Users/daipayan/Documents/SOC/SentinelAgent/SentinelAgent.csproj",
+      "targetGraphs": []
+    }
+  ]
+}
