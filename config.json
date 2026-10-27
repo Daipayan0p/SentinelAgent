@@ -1,6 +1,14 @@
 {
-  "serverUrl": "http://localhost:8080/api/logs",
+  "serverUrl": "https://YOUR-NGROK-URL.ngrok-free.app/api/logs",
   "batchSize": 50,
   "sendIntervalSeconds": 5,
-  "maxBufferedLogs": 10000
+  "maxBufferedLogs": 10000,
+  "retryMaxAttempts": 3,
+  "retryBaseDelayMs": 500,
+  "requestTimeoutSeconds": 15,
+  "compressPayload": true,
+  "includeRawXml": false,
+  "collectExistingEventsOnStartup": false,
+  "initialEventsPerChannel": 100,
+  "runHidden": false
 }

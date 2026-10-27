@@ -1,7 +1,12 @@
-﻿using System.Diagnostics.Eventing.Reader;
-using System.Net.Http.Json;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics.Eventing.Reader;
+using System.IO.Compression;
+using System.Net.Http.Headers;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Xml;
 
 namespace SentinelAgent;
 
@@ -16,82 +21,109 @@ internal class Program
 
     private static readonly List<EventLogWatcher> Watchers = new();
 
-    private static readonly Queue<WindowsLogEvent> LogQueue = new();
+    private static readonly ConcurrentQueue<WindowsLogEvent> LogQueue = new();
 
-    private static readonly object QueueLock = new();
-
-    private static readonly CancellationTokenSource Cancellation =
-        new();
+    private static readonly CancellationTokenSource Cancellation = new();
 
     private static long TotalCollected;
     private static long TotalSent;
     private static long TotalFailed;
+    private static long TotalDropped;
+
+    private static int ActiveWatchers;
+
+    // ============================================================
+    // MAIN
+    // ============================================================
 
     private static async Task Main()
     {
-        Console.Title = "SentinelAgent";
-
-        PrintBanner();
-
+        // Load configuration before creating a console.
         if (!LoadConfiguration())
         {
-            Console.WriteLine();
-            Console.WriteLine("SentinelAgent could not start.");
             return;
         }
 
-        Console.WriteLine(
-            $"[CONFIG] Server: {_config.ServerUrl}");
-
-        Console.WriteLine(
-            $"[CONFIG] Batch size: {_config.BatchSize}");
-
-        Console.WriteLine(
-            $"[CONFIG] Send interval: {_config.SendIntervalSeconds}s");
-
-        Console.WriteLine();
-
-        if (!Uri.TryCreate(
-                _config.ServerUrl,
-                UriKind.Absolute,
-                out Uri? serverUri))
+        // WinExe does not create a console automatically.
+        // We create one only when runHidden == false.
+        if (!_config.RunHidden)
         {
-            Console.WriteLine(
-                "[ERROR] Invalid serverUrl in config.json.");
+            ConsoleWindow.Allocate();
 
-            return;
+            Console.Title = "SentinelAgent";
+
+            PrintBanner();
+            PrintConfiguration();
         }
 
-        if (serverUri.Scheme != Uri.UriSchemeHttp &&
-            serverUri.Scheme != Uri.UriSchemeHttps)
+        if (!ValidateServerUrl())
         {
-            Console.WriteLine(
-                "[ERROR] serverUrl must use HTTP or HTTPS.");
-
             return;
         }
-
-        StartEventLogCollection();
-
-        Console.WriteLine();
-        Console.WriteLine(
-            $"[READY] Monitoring {Watchers.Count} Windows Event Log channels.");
-
-        Console.WriteLine(
-            "[READY] SentinelAgent is running.");
-
-        Console.WriteLine();
 
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
 
-            Cancellation.Cancel();
+            if (!_config.RunHidden)
+            {
+                Console.WriteLine();
+                Console.WriteLine(
+                    "[STOP] Shutdown requested...");
+            }
 
-            StopWatchers();
+            Cancellation.Cancel();
         };
 
-        await RunSenderLoop(Cancellation.Token);
+        StartEventLogCollection();
+
+        if (!_config.RunHidden)
+        {
+            Console.WriteLine();
+            Console.WriteLine(
+                $"[READY] Active watchers: {ActiveWatchers}");
+
+            Console.WriteLine(
+                "[READY] SentinelAgent is running.");
+
+            Console.WriteLine(
+                "[READY] Press CTRL+C to stop.");
+
+            Console.WriteLine();
+        }
+
+        try
+        {
+            await RunSenderLoop(
+                Cancellation.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected during shutdown.
+        }
+        finally
+        {
+            StopWatchers();
+
+            using var flushCts =
+                new CancellationTokenSource(
+                    TimeSpan.FromSeconds(10));
+
+            try
+            {
+                await SendAvailableLogs(
+                    flushCts.Token);
+            }
+            catch
+            {
+                // Best effort only.
+            }
+
+            if (!_config.RunHidden)
+            {
+                PrintStatistics();
+            }
+        }
     }
 
     // ============================================================
@@ -123,27 +155,21 @@ internal class Program
     {
         try
         {
-            string configPath = Path.Combine(
-                AppContext.BaseDirectory,
-                "config.json");
+            string configPath =
+                Path.Combine(
+                    AppContext.BaseDirectory,
+                    "config.json");
 
             if (!File.Exists(configPath))
             {
-                CreateDefaultConfiguration(configPath);
-
-                Console.WriteLine(
-                    "[CONFIG] config.json was not found.");
-
-                Console.WriteLine(
-                    "[CONFIG] A new config.json was created.");
-
-                Console.WriteLine(
-                    "[CONFIG] Edit it and start SentinelAgent again.");
+                CreateDefaultConfiguration(
+                    configPath);
 
                 return false;
             }
 
-            string json = File.ReadAllText(configPath);
+            string json =
+                File.ReadAllText(configPath);
 
             AgentConfig? config =
                 JsonSerializer.Deserialize<AgentConfig>(
@@ -155,9 +181,6 @@ internal class Program
 
             if (config == null)
             {
-                Console.WriteLine(
-                    "[ERROR] Could not parse config.json.");
-
                 return false;
             }
 
@@ -166,9 +189,6 @@ internal class Program
             if (string.IsNullOrWhiteSpace(
                     _config.ServerUrl))
             {
-                Console.WriteLine(
-                    "[ERROR] serverUrl cannot be empty.");
-
                 return false;
             }
 
@@ -187,13 +207,30 @@ internal class Program
                 _config.MaxBufferedLogs = 10000;
             }
 
+            if (_config.RetryMaxAttempts <= 0)
+            {
+                _config.RetryMaxAttempts = 3;
+            }
+
+            if (_config.RetryBaseDelayMs <= 0)
+            {
+                _config.RetryBaseDelayMs = 500;
+            }
+
+            if (_config.RequestTimeoutSeconds <= 0)
+            {
+                _config.RequestTimeoutSeconds = 15;
+            }
+
+            if (_config.InitialEventsPerChannel < 0)
+            {
+                _config.InitialEventsPerChannel = 0;
+            }
+
             return true;
         }
-        catch (Exception ex)
+        catch
         {
-            Console.WriteLine(
-                $"[ERROR] Config error: {ex.Message}");
-
             return false;
         }
     }
@@ -210,49 +247,163 @@ internal class Program
 
             SendIntervalSeconds = 5,
 
-            MaxBufferedLogs = 10000
+            MaxBufferedLogs = 10000,
+
+            RetryMaxAttempts = 3,
+
+            RetryBaseDelayMs = 500,
+
+            RequestTimeoutSeconds = 15,
+
+            CompressPayload = true,
+
+            IncludeRawXml = false,
+
+            CollectExistingEventsOnStartup = false,
+
+            InitialEventsPerChannel = 100,
+
+            RunHidden = false
         };
 
-        string json = JsonSerializer.Serialize(
-            config,
-            new JsonSerializerOptions
-            {
-                WriteIndented = true
-            });
+        string json =
+            JsonSerializer.Serialize(
+                config,
+                new JsonSerializerOptions
+                {
+                    WriteIndented = true
+                });
 
-        File.WriteAllText(path, json);
+        File.WriteAllText(
+            path,
+            json);
+    }
+
+    private static void PrintConfiguration()
+    {
+        Console.WriteLine(
+            $"[CONFIG] Server:            {_config.ServerUrl}");
+
+        Console.WriteLine(
+            $"[CONFIG] Batch size:        {_config.BatchSize}");
+
+        Console.WriteLine(
+            $"[CONFIG] Send interval:     {_config.SendIntervalSeconds}s");
+
+        Console.WriteLine(
+            $"[CONFIG] Max buffer:        {_config.MaxBufferedLogs}");
+
+        Console.WriteLine(
+            $"[CONFIG] Compression:       {_config.CompressPayload}");
+
+        Console.WriteLine(
+            $"[CONFIG] Raw XML:           {_config.IncludeRawXml}");
+
+        Console.WriteLine(
+            $"[CONFIG] Historical events: {_config.CollectExistingEventsOnStartup}");
+
+        Console.WriteLine(
+            $"[CONFIG] Initial/channel:   {_config.InitialEventsPerChannel}");
+
+        Console.WriteLine(
+            $"[CONFIG] Run hidden:        {_config.RunHidden}");
+
+        Console.WriteLine();
+    }
+
+    private static bool ValidateServerUrl()
+    {
+        if (!Uri.TryCreate(
+                _config.ServerUrl,
+                UriKind.Absolute,
+                out Uri? serverUri))
+        {
+            if (!_config.RunHidden)
+            {
+                Console.WriteLine(
+                    "[ERROR] Invalid serverUrl.");
+            }
+
+            return false;
+        }
+
+        if (serverUri.Scheme != Uri.UriSchemeHttp &&
+            serverUri.Scheme != Uri.UriSchemeHttps)
+        {
+            if (!_config.RunHidden)
+            {
+                Console.WriteLine(
+                    "[ERROR] serverUrl must use HTTP or HTTPS.");
+            }
+
+            return false;
+        }
+
+        HttpClient.Timeout =
+            TimeSpan.FromSeconds(
+                _config.RequestTimeoutSeconds);
+
+        return true;
     }
 
     // ============================================================
-    // EVENT LOG COLLECTION
+    // EVENT LOG DISCOVERY
     // ============================================================
 
     private static void StartEventLogCollection()
     {
-        Console.WriteLine(
-            "[INIT] Discovering Windows Event Logs...");
+        if (!_config.RunHidden)
+        {
+            Console.WriteLine(
+                "[INIT] Discovering Windows Event Logs...");
+        }
 
         try
         {
             using EventLogSession session =
-                new();
+                new EventLogSession();
 
             IEnumerable<string> logNames =
                 session.GetLogNames();
 
+            int discovered = 0;
+
             foreach (string logName in logNames)
             {
+                discovered++;
+
                 StartWatcher(logName);
+
+                if (_config.CollectExistingEventsOnStartup)
+                {
+                    ReadExistingEvents(
+                        logName,
+                        _config.InitialEventsPerChannel);
+                }
+            }
+
+            if (!_config.RunHidden)
+            {
+                Console.WriteLine(
+                    $"[INIT] Discovered {discovered} channels.");
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine(
-                $"[ERROR] Could not enumerate Event Logs: {ex.Message}");
+            if (!_config.RunHidden)
+            {
+                Console.WriteLine(
+                    $"[ERROR] Could not enumerate Event Logs: {ex.Message}");
+            }
         }
     }
 
-    private static void StartWatcher(string channel)
+    // ============================================================
+    // EVENT WATCHER
+    // ============================================================
+
+    private static void StartWatcher(
+        string channel)
     {
         try
         {
@@ -263,7 +414,7 @@ internal class Program
                     "*[System[*]]");
 
             EventLogWatcher watcher =
-                new(query);
+                new EventLogWatcher(query);
 
             watcher.EventRecordWritten +=
                 OnEventRecordWritten;
@@ -275,18 +426,104 @@ internal class Program
                 Watchers.Add(watcher);
             }
 
-            Console.WriteLine(
-                $"[WATCH] {channel}");
+            Interlocked.Increment(
+                ref ActiveWatchers);
+
+            if (!_config.RunHidden)
+            {
+                Console.WriteLine(
+                    $"[WATCH] {channel}");
+            }
         }
-        catch
+        catch (Exception ex)
         {
-            // Some Windows logs are inaccessible without
-            // administrator privileges.
+            if (!_config.RunHidden)
+            {
+                Console.WriteLine(
+                    $"[SKIP] {channel} - {ex.Message}");
+            }
         }
     }
 
     // ============================================================
-    // EVENT RECEIVED
+    // OPTIONAL HISTORICAL EVENTS
+    // ============================================================
+
+    private static void ReadExistingEvents(
+        string channel,
+        int maximumEvents)
+    {
+        if (maximumEvents <= 0)
+        {
+            return;
+        }
+
+        try
+        {
+            EventLogQuery query =
+                new EventLogQuery(
+                    channel,
+                    PathType.LogName,
+                    "*[System[*]]");
+
+            using EventLogReader reader =
+                new EventLogReader(query);
+
+            var records =
+                new List<EventRecord>();
+
+            EventRecord? record;
+
+            while (
+                records.Count < maximumEvents &&
+                (record = reader.ReadEvent()) != null)
+            {
+                records.Add(record);
+            }
+
+            // Send oldest to newest.
+            records.Reverse();
+
+            foreach (EventRecord existingRecord in records)
+            {
+                using (existingRecord)
+                {
+                    WindowsLogEvent? log =
+                        ConvertEventRecord(
+                            existingRecord);
+
+                    if (log == null)
+                    {
+                        continue;
+                    }
+
+                    log.IsHistorical = true;
+
+                    AddToQueue(log);
+
+                    Interlocked.Increment(
+                        ref TotalCollected);
+                }
+            }
+
+            if (!_config.RunHidden)
+            {
+                Console.WriteLine(
+                    $"[INITIAL] {channel}: {records.Count} events");
+            }
+        }
+        catch (Exception ex)
+        {
+            if (!_config.RunHidden)
+            {
+                Console.WriteLine(
+                    $"[INITIAL-SKIP] {channel}: {ex.Message}");
+            }
+        }
+    }
+
+    // ============================================================
+    // LIVE EVENT
     // ============================================================
 
     private static void OnEventRecordWritten(
@@ -300,9 +537,39 @@ internal class Program
 
         try
         {
-            EventRecord record =
+            using EventRecord record =
                 args.EventRecord;
 
+            WindowsLogEvent? log =
+                ConvertEventRecord(record);
+
+            if (log == null)
+            {
+                return;
+            }
+
+            AddToQueue(log);
+
+            Interlocked.Increment(
+                ref TotalCollected);
+        }
+        catch
+        {
+            // Never let one malformed event kill
+            // the whole collector.
+        }
+    }
+
+    // ============================================================
+    // EVENT CONVERSION
+    // ============================================================
+
+    private static WindowsLogEvent?
+        ConvertEventRecord(
+            EventRecord record)
+    {
+        try
+        {
             string message = string.Empty;
 
             try
@@ -316,12 +583,36 @@ internal class Program
                 // Some events cannot be formatted.
             }
 
-            var log = new WindowsLogEvent
+            string completeXml = string.Empty;
+            string rawXml = string.Empty;
+
+            try
             {
-                AgentId = AgentIdentity.Id,
+                completeXml = record.ToXml();
+
+                if (_config.IncludeRawXml)
+                {
+                    rawXml = completeXml;
+                }
+            }
+            catch
+            {
+                // XML extraction failed.
+            }
+
+            Dictionary<string, string> eventData =
+                ParseEventData(completeXml);
+
+            return new WindowsLogEvent
+            {
+                AgentId =
+                    AgentIdentity.Id,
 
                 Hostname =
                     Environment.MachineName,
+
+                MachineName =
+                    record.MachineName ?? string.Empty,
 
                 Channel =
                     record.LogName ?? string.Empty,
@@ -336,7 +627,8 @@ internal class Program
                     record.LevelDisplayName ?? string.Empty,
 
                 TimeCreated =
-                    record.TimeCreated,
+                    record.TimeCreated?
+                        .ToUniversalTime(),
 
                 RecordId =
                     record.RecordId,
@@ -347,26 +639,84 @@ internal class Program
                 ThreadId =
                     record.ThreadId,
 
-                MachineName =
-                    record.MachineName ?? string.Empty,
-
                 Message =
                     message,
 
+                EventData =
+                    eventData,
+
                 RawXml =
-                    record.ToXml()
+                    rawXml,
+
+                IsHistorical = false
             };
-
-            AddToQueue(log);
-
-            Interlocked.Increment(
-                ref TotalCollected);
         }
         catch
         {
-            // Never allow a single malformed event
-            // to kill the collector.
+            return null;
         }
+    }
+
+    // ============================================================
+    // EVENT DATA EXTRACTION
+    // ============================================================
+
+    private static Dictionary<string, string>
+        ParseEventData(string xml)
+    {
+        var result =
+            new Dictionary<string, string>(
+                StringComparer.OrdinalIgnoreCase);
+
+        if (string.IsNullOrWhiteSpace(xml))
+        {
+            return result;
+        }
+
+        try
+        {
+            var document =
+                new XmlDocument();
+
+            document.LoadXml(xml);
+
+            XmlNode? eventData =
+                document.SelectSingleNode(
+                    "//*[local-name()='EventData']");
+
+            if (eventData == null)
+            {
+                return result;
+            }
+
+            foreach (XmlNode node in eventData.ChildNodes)
+            {
+                if (!string.Equals(
+                        node.LocalName,
+                        "Data",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                string? name =
+                    node.Attributes?["Name"]?.Value;
+
+                string value =
+                    node.InnerText ?? string.Empty;
+
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    result[name] = value;
+                }
+            }
+        }
+        catch
+        {
+            // Ignore XML parsing failures.
+        }
+
+        return result;
     }
 
     // ============================================================
@@ -376,15 +726,20 @@ internal class Program
     private static void AddToQueue(
         WindowsLogEvent log)
     {
-        lock (QueueLock)
-        {
-            while (LogQueue.Count >=
-                   _config.MaxBufferedLogs)
-            {
-                LogQueue.Dequeue();
-            }
+        LogQueue.Enqueue(log);
 
-            LogQueue.Enqueue(log);
+        while (LogQueue.Count >
+               _config.MaxBufferedLogs)
+        {
+            if (LogQueue.TryDequeue(out _))
+            {
+                Interlocked.Increment(
+                    ref TotalDropped);
+            }
+            else
+            {
+                break;
+            }
         }
     }
 
@@ -392,57 +747,44 @@ internal class Program
         GetBatch(int amount)
     {
         var batch =
-            new List<WindowsLogEvent>();
+            new List<WindowsLogEvent>(amount);
 
-        lock (QueueLock)
+        while (
+            batch.Count < amount &&
+            LogQueue.TryDequeue(
+                out WindowsLogEvent? log))
         {
-            while (batch.Count < amount &&
-                   LogQueue.Count > 0)
-            {
-                batch.Add(
-                    LogQueue.Dequeue());
-            }
+            batch.Add(log);
         }
 
         return batch;
     }
 
     private static void ReturnBatch(
-        List<WindowsLogEvent> batch)
+        IEnumerable<WindowsLogEvent> logs)
     {
-        lock (QueueLock)
+        foreach (WindowsLogEvent log in logs)
         {
-            var existing =
-                LogQueue.ToList();
+            LogQueue.Enqueue(log);
+        }
 
-            LogQueue.Clear();
-
-            foreach (WindowsLogEvent log in batch)
+        while (LogQueue.Count >
+               _config.MaxBufferedLogs)
+        {
+            if (LogQueue.TryDequeue(out _))
             {
-                if (LogQueue.Count >=
-                    _config.MaxBufferedLogs)
-                {
-                    break;
-                }
-
-                LogQueue.Enqueue(log);
+                Interlocked.Increment(
+                    ref TotalDropped);
             }
-
-            foreach (WindowsLogEvent log in existing)
+            else
             {
-                if (LogQueue.Count >=
-                    _config.MaxBufferedLogs)
-                {
-                    break;
-                }
-
-                LogQueue.Enqueue(log);
+                break;
             }
         }
     }
 
     // ============================================================
-    // SEND LOOP
+    // SENDER LOOP
     // ============================================================
 
     private static async Task RunSenderLoop(
@@ -457,8 +799,11 @@ internal class Program
             }
             catch (Exception ex)
             {
-                Console.WriteLine(
-                    $"[SEND ERROR] {ex.Message}");
+                if (!_config.RunHidden)
+                {
+                    Console.WriteLine(
+                        $"[SEND ERROR] {ex.Message}");
+                }
             }
 
             try
@@ -476,13 +821,13 @@ internal class Program
     }
 
     // ============================================================
-    // HTTP SENDING
+    // SEND AVAILABLE LOGS
     // ============================================================
 
     private static async Task SendAvailableLogs(
         CancellationToken cancellationToken)
     {
-        while (true)
+        while (!cancellationToken.IsCancellationRequested)
         {
             List<WindowsLogEvent> batch =
                 GetBatch(_config.BatchSize);
@@ -492,67 +837,48 @@ internal class Program
                 return;
             }
 
-            var payload = new LogBatch
-            {
-                AgentId =
-                    AgentIdentity.Id,
-
-                Hostname =
-                    Environment.MachineName,
-
-                OperatingSystem =
-                    Environment.OSVersion
-                        .VersionString,
-
-                SentAt =
-                    DateTime.UtcNow,
-
-                Logs =
-                    batch
-            };
-
-            try
-            {
-                HttpResponseMessage response =
-                    await HttpClient.PostAsJsonAsync(
-                        _config.ServerUrl,
-                        payload,
-                        cancellationToken);
-
-                if (response.IsSuccessStatusCode)
+            var payload =
+                new LogBatch
                 {
-                    Interlocked.Add(
-                        ref TotalSent,
-                        batch.Count);
+                    AgentId =
+                        AgentIdentity.Id,
 
+                    Hostname =
+                        Environment.MachineName,
+
+                    OperatingSystem =
+                        Environment.OSVersion.VersionString,
+
+                    SentAt =
+                        DateTime.UtcNow,
+
+                    Logs =
+                        batch
+                };
+
+            bool success =
+                await SendBatch(
+                    payload,
+                    cancellationToken);
+
+            if (success)
+            {
+                Interlocked.Add(
+                    ref TotalSent,
+                    batch.Count);
+
+                if (!_config.RunHidden)
+                {
                     Console.WriteLine(
                         $"[SENT] {batch.Count} logs | " +
-                        $"Queue: {GetQueueSize()} | " +
+                        $"Queue: {LogQueue.Count} | " +
                         $"Total Sent: {TotalSent}");
                 }
-                else
-                {
-                    Interlocked.Increment(
-                        ref TotalFailed);
-
-                    Console.WriteLine(
-                        $"[SERVER ERROR] " +
-                        $"{(int)response.StatusCode} " +
-                        $"{response.StatusCode}");
-
-                    ReturnBatch(batch);
-
-                    return;
-                }
             }
-            catch (Exception ex)
+            else
             {
                 Interlocked.Increment(
                     ref TotalFailed);
-
-                Console.WriteLine(
-                    $"[NETWORK] Server unavailable: " +
-                    $"{ex.Message}");
 
                 ReturnBatch(batch);
 
@@ -562,31 +888,159 @@ internal class Program
     }
 
     // ============================================================
-    // QUEUE SIZE
+    // HTTP SEND + RETRY + GZIP
     // ============================================================
 
-    private static int GetQueueSize()
+    private static async Task<bool> SendBatch(
+        LogBatch payload,
+        CancellationToken cancellationToken)
     {
-        lock (QueueLock)
+        byte[] jsonBytes =
+            JsonSerializer.SerializeToUtf8Bytes(
+                payload,
+                AgentJsonContext.Default.LogBatch);
+
+        byte[] bodyBytes =
+            _config.CompressPayload
+                ? Compress(jsonBytes)
+                : jsonBytes;
+
+        int attempts =
+            Math.Max(
+                1,
+                _config.RetryMaxAttempts);
+
+        for (
+            int attempt = 1;
+            attempt <= attempts;
+            attempt++)
         {
-            return LogQueue.Count;
+            try
+            {
+                using var content =
+                    new ByteArrayContent(bodyBytes);
+
+                content.Headers.ContentType =
+                    new MediaTypeHeaderValue(
+                        "application/json");
+
+                if (_config.CompressPayload)
+                {
+                    content.Headers.ContentEncoding.Add(
+                        "gzip");
+                }
+
+                using var request =
+                    new HttpRequestMessage(
+                        HttpMethod.Post,
+                        _config.ServerUrl)
+                    {
+                        Content = content
+                    };
+
+                using HttpResponseMessage response =
+                    await HttpClient.SendAsync(
+                        request,
+                        cancellationToken);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    return true;
+                }
+
+                int status =
+                    (int)response.StatusCode;
+
+                if (!_config.RunHidden)
+                {
+                    Console.WriteLine(
+                        $"[SERVER] {status} " +
+                        $"{response.StatusCode} " +
+                        $"(attempt {attempt}/{attempts})");
+                }
+
+                // 4xx normally means the request itself
+                // is invalid, so retrying is not useful.
+                if (status >= 400 &&
+                    status < 500)
+                {
+                    return false;
+                }
+            }
+            catch (
+                Exception ex)
+                when (
+                    ex is HttpRequestException ||
+                    ex is TaskCanceledException ||
+                    ex is SocketException)
+            {
+                if (!_config.RunHidden)
+                {
+                    Console.WriteLine(
+                        $"[NETWORK] {ex.Message} " +
+                        $"(attempt {attempt}/{attempts})");
+                }
+            }
+
+            if (attempt < attempts)
+            {
+                int delay =
+                    _config.RetryBaseDelayMs *
+                    (int)Math.Pow(
+                        2,
+                        attempt - 1);
+
+                try
+                {
+                    await Task.Delay(
+                        delay,
+                        cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    return false;
+                }
+            }
         }
+
+        return false;
     }
 
     // ============================================================
-    // STOP
+    // GZIP
+    // ============================================================
+
+    private static byte[] Compress(
+        byte[] data)
+    {
+        using var output =
+            new MemoryStream();
+
+        using (
+            var gzip =
+                new GZipStream(
+                    output,
+                    CompressionLevel.Fastest,
+                    leaveOpen: true))
+        {
+            gzip.Write(
+                data,
+                0,
+                data.Length);
+        }
+
+        return output.ToArray();
+    }
+
+    // ============================================================
+    // STOP WATCHERS
     // ============================================================
 
     private static void StopWatchers()
     {
-        Console.WriteLine();
-        Console.WriteLine(
-            "[STOP] Stopping SentinelAgent...");
-
         lock (Watchers)
         {
-            foreach (EventLogWatcher watcher
-                     in Watchers)
+            foreach (EventLogWatcher watcher in Watchers)
             {
                 try
                 {
@@ -601,11 +1055,48 @@ internal class Program
 
             Watchers.Clear();
         }
+    }
+
+    // ============================================================
+    // STATISTICS
+    // ============================================================
+
+    private static void PrintStatistics()
+    {
+        Console.WriteLine();
 
         Console.WriteLine(
-            "[STOP] SentinelAgent stopped.");
+            "==================================================");
+
+        Console.WriteLine(
+            "                 SENTINELAGENT");
+
+        Console.WriteLine(
+            "                   STATISTICS");
+
+        Console.WriteLine(
+            "==================================================");
+
+        Console.WriteLine(
+            $"Collected : {TotalCollected}");
+
+        Console.WriteLine(
+            $"Sent      : {TotalSent}");
+
+        Console.WriteLine(
+            $"Failed    : {TotalFailed}");
+
+        Console.WriteLine(
+            $"Dropped   : {TotalDropped}");
+
+        Console.WriteLine(
+            $"Queued    : {LogQueue.Count}");
+
+        Console.WriteLine(
+            "==================================================");
     }
 }
+
 
 // ================================================================
 // CONFIGURATION
@@ -624,7 +1115,32 @@ public class AgentConfig
 
     [JsonPropertyName("maxBufferedLogs")]
     public int MaxBufferedLogs { get; set; } = 10000;
+
+    [JsonPropertyName("retryMaxAttempts")]
+    public int RetryMaxAttempts { get; set; } = 3;
+
+    [JsonPropertyName("retryBaseDelayMs")]
+    public int RetryBaseDelayMs { get; set; } = 500;
+
+    [JsonPropertyName("requestTimeoutSeconds")]
+    public int RequestTimeoutSeconds { get; set; } = 15;
+
+    [JsonPropertyName("compressPayload")]
+    public bool CompressPayload { get; set; } = true;
+
+    [JsonPropertyName("includeRawXml")]
+    public bool IncludeRawXml { get; set; } = false;
+
+    [JsonPropertyName("collectExistingEventsOnStartup")]
+    public bool CollectExistingEventsOnStartup { get; set; } = false;
+
+    [JsonPropertyName("initialEventsPerChannel")]
+    public int InitialEventsPerChannel { get; set; } = 100;
+
+    [JsonPropertyName("runHidden")]
+    public bool RunHidden { get; set; } = false;
 }
+
 
 // ================================================================
 // SERVER PAYLOAD
@@ -648,8 +1164,9 @@ public class LogBatch
     public List<WindowsLogEvent> Logs { get; set; } = new();
 }
 
+
 // ================================================================
-// WINDOWS LOG
+// WINDOWS EVENT
 // ================================================================
 
 public class WindowsLogEvent
@@ -690,9 +1207,17 @@ public class WindowsLogEvent
     [JsonPropertyName("message")]
     public string Message { get; set; } = "";
 
+    [JsonPropertyName("eventData")]
+    public Dictionary<string, string> EventData { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
+
     [JsonPropertyName("rawXml")]
     public string RawXml { get; set; } = "";
+
+    [JsonPropertyName("isHistorical")]
+    public bool IsHistorical { get; set; }
 }
+
 
 // ================================================================
 // MACHINE IDENTITY
@@ -718,7 +1243,8 @@ public static class AgentIdentity
                 return _id;
             }
 
-            _id = LoadOrCreateId();
+            _id =
+                LoadOrCreateId();
 
             return _id;
         }
@@ -729,7 +1255,8 @@ public static class AgentIdentity
         try
         {
             string? directory =
-                Path.GetDirectoryName(FilePath);
+                Path.GetDirectoryName(
+                    FilePath);
 
             if (!string.IsNullOrWhiteSpace(directory))
             {
@@ -740,8 +1267,9 @@ public static class AgentIdentity
             if (File.Exists(FilePath))
             {
                 string existing =
-                    File.ReadAllText(FilePath)
-                        .Trim();
+                    File.ReadAllText(
+                        FilePath)
+                    .Trim();
 
                 if (!string.IsNullOrWhiteSpace(existing))
                 {
@@ -764,3 +1292,38 @@ public static class AgentIdentity
         }
     }
 }
+
+
+// ================================================================
+// SOURCE-GENERATED JSON
+// ================================================================
+
+[JsonSourceGenerationOptions(
+    PropertyNameCaseInsensitive = true)]
+
+[JsonSerializable(typeof(AgentConfig))]
+[JsonSerializable(typeof(LogBatch))]
+[JsonSerializable(typeof(WindowsLogEvent))]
+[JsonSerializable(typeof(Dictionary<string, string>))]
+internal partial class AgentJsonContext :
+    JsonSerializerContext
+{
+}
+
+
+// ================================================================
+// WINDOWS CONSOLE CONTROL
+// ================================================================
+
+internal static class ConsoleWindow
+{
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AllocConsole();
+
+    public static void Allocate()
+    {
+        AllocConsole();
+    }
+}
+
